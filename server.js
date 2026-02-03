@@ -33,7 +33,7 @@ const IVR_FLOW = {
     listenFor: ['overnight', 'overnight visit'],
     sendDTMF: '',  // Don't send anything, just wait
     nextStep: 'step5',
-    waitOnly: true  // Flag to indicate we're just waiting for next prompt
+    waitOnly: true
   },
   step5: {
     listenFor: ['token number', 'enter token'],
@@ -45,7 +45,7 @@ const IVR_FLOW = {
     listenFor: ['time'],
     sendDTMF: '',  // Success! Call complete
     nextStep: 'complete',
-    successIndicator: true  // This confirms the call worked
+    successIndicator: true
   }
 };
 
@@ -124,9 +124,25 @@ async function handleTranscript(callSid, transcript) {
       console.log(`[${callSid}] Sending DTMF: ${currentStep.sendDTMF}`);
       
       try {
-        await twilioClient.calls(callSid).update({
-          twiml: `<Response><Play digits="${currentStep.sendDTMF}"/></Response>`
-        });
+        // Find the IVR participant in the conference
+        const conferenceName = callState.conferenceName;
+        const participants = await twilioClient.conferences(conferenceName)
+          .participants
+          .list();
+        
+        // Find the participant that's NOT the original call (that's the IVR)
+        const ivrParticipant = participants.find(p => p.callSid !== callSid);
+        
+        if (ivrParticipant) {
+          // Send DTMF to the IVR participant
+          await twilioClient.conferences(conferenceName)
+            .participants(ivrParticipant.callSid)
+            .update({
+              announceUrl: `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/play-dtmf?digits=${encodeURIComponent(currentStep.sendDTMF)}`
+            });
+
+          console.log(`[${callSid}] DTMF sent to IVR participant`);
+        }
 
         // Move to next step
         callState.currentStep = currentStep.nextStep;
@@ -160,16 +176,21 @@ wss.on('connection', (ws) => {
         streamSid = msg.start.streamSid;
         console.log(`[${callSid}] Media stream started`);
 
-        // Initialize call state
-        activeCalls.set(callSid, {
-          currentStep: 'step1',
-          streamSid: streamSid,
-          startTime: new Date()
-        });
+        // Get call state (should already exist from /start-call)
+        let callState = activeCalls.get(callSid);
+        if (!callState) {
+          callState = {
+            currentStep: 'step1',
+            startTime: new Date()
+          };
+          activeCalls.set(callSid, callState);
+        }
+
+        callState.streamSid = streamSid;
 
         // Connect to Deepgram for transcription
         deepgramWs = connectToDeepgram(callSid);
-        activeCalls.get(callSid).deepgramWs = deepgramWs;
+        callState.deepgramWs = deepgramWs;
         break;
 
       case 'media':
@@ -187,7 +208,6 @@ wss.on('connection', (ws) => {
         if (deepgramWs) {
           deepgramWs.close();
         }
-        activeCalls.delete(callSid);
         break;
     }
   });
@@ -196,9 +216,6 @@ wss.on('connection', (ws) => {
     console.log(`[${callSid}] WebSocket closed`);
     if (deepgramWs) {
       deepgramWs.close();
-    }
-    if (callSid) {
-      activeCalls.delete(callSid);
     }
   });
 });
@@ -212,14 +229,58 @@ app.get('/', (req, res) => {
   res.send('Twilio IVR Listener is running');
 });
 
-// TwiML endpoint for initiating calls
+// TwiML endpoint for initiating calls - CONFERENCE BASED
 app.post('/start-call', (req, res) => {
+  const callSid = req.body.CallSid || 'unknown';
+  const conferenceName = `ivr-call-${callSid}`;
+  
+  // Store conference name for this call
+  activeCalls.set(callSid, {
+    currentStep: 'step1',
+    startTime: new Date(),
+    conferenceName: conferenceName
+  });
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://${req.get('host')}/media-stream" />
   </Connect>
-  <Dial>${process.env.IVR_PHONE_NUMBER}</Dial>
+  <Dial>
+    <Conference 
+      beep="false" 
+      waitUrl="" 
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true">${conferenceName}</Conference>
+  </Dial>
+</Response>`;
+  
+  res.type('text/xml');
+  res.send(twiml);
+});
+
+// TwiML endpoint for dialing the IVR into the conference
+app.post('/dial-ivr', (req, res) => {
+  const conferenceName = req.query.conference;
+  
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference beep="false">${conferenceName}</Conference>
+  </Dial>
+</Response>`;
+  
+  res.type('text/xml');
+  res.send(twiml);
+});
+
+// Endpoint to play DTMF tones
+app.post('/play-dtmf', (req, res) => {
+  const digits = req.query.digits || '';
+  
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play digits="${digits}"/>
 </Response>`;
   
   res.type('text/xml');
@@ -231,6 +292,11 @@ app.post('/call-status', (req, res) => {
   const callSid = req.body.CallSid;
   const callStatus = req.body.CallStatus;
   console.log(`[${callSid}] Call status: ${callStatus}`);
+  
+  if (callStatus === 'completed') {
+    activeCalls.delete(callSid);
+  }
+  
   res.sendStatus(200);
 });
 
@@ -239,6 +305,7 @@ app.get('/status', (req, res) => {
   const calls = Array.from(activeCalls.entries()).map(([sid, state]) => ({
     callSid: sid,
     currentStep: state.currentStep,
+    conferenceName: state.conferenceName,
     startTime: state.startTime,
     success: state.success || false
   }));
